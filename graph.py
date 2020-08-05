@@ -64,14 +64,14 @@ class GraphConvolution(Layer):
     # core code
     def call(self, inputs, mask=None):
         features = inputs[0]
-        basis = inputs[1:] # this is a list
+        basis = inputs[1:] # this is a list 邻接矩阵
         supports = list()
-        for i in range(self.support):
+        for i in range(len(basis)):
             # A * X
-            supports.append(K.dot(basis[i], features))
+            supports.append(K.dot(basis[i], features)) # 邻接性决定属性权重
         supports = K.concatenate(supports, axis=1)
         # A * X * W
-        output = K.dot(supports, self.kernel)
+        output = K.dot(supports, self.kernel)# 反向传播决定属性权重
         if tf.is_tensor(self.bias) :
             output += self.bias
         return self.activation(output)

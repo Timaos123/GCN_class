@@ -19,7 +19,7 @@ class MyGCN():
         self,
         x,
         y,
-        adj,
+        adjList,
         batch_size=64,
         epochs=100,
         dataset='cora', # Local pooling filters (see 'renormalization trick' in Kipf & Welling, arXiv 2016)
@@ -28,25 +28,26 @@ class MyGCN():
         sym_norm=True,  # symmetric (True) vs. left-only (False) normalization
         NB_EPOCH=20,
         PATIENCE=10,  # early stopping patience
-        support=1,
     ):
         self.filter=filter
         self.max_degree = max_degree
         self.sym_norm = sym_norm
         self.NB_EPOCH = NB_EPOCH
         self.PATIENCE = PATIENCE
-        self.support = support
         self.epochs = epochs
         self.batch_size = x.shape[0]
         self.featureNum=x.shape[1]
         
         y_train, y_val, y_test, idx_train, idx_val, idx_test, train_mask = get_splits(y)
         self.train_mask=train_mask
-        if type(adj)!=sc.sparse.csr_matrix:
-            adj=sc.sparse.csr_matrix(adj)
-        self.adj=adj
+        for adjI in range(len(adjList)):
+            if type(adjList[adjI])!=sc.sparse.csr_matrix:
+                adjList[adjI]=sc.sparse.csr_matrix(adjList[adjI])
+        self.adjList=adjList
         
-        x_graph, adj_input = self.get_inputs(self.adj, x)
+        self.support=len(self.adjList)#超图数量
+
+        x_graph, adj_input = self.get_inputs(self.adjList, x)
         
         self.myGCNModel=self.build_model(x, y, adj_input)
         
@@ -54,13 +55,15 @@ class MyGCN():
         self.history=self.myGCNModel.fit(x_graph, y, sample_weight=self.train_mask,
                             batch_size=self.batch_size, epochs=self.epochs, shuffle=False)
 
-    def get_inputs(self,adj, x):
+    def get_inputs(self,adjList, x):
         if self.filter == 'localpool':
             print('Using local pooling filters...')
-            adj_ = preprocess_adj(adj, self.sym_norm)
-            adj_ = adj_.todense()
-            graph = [x, adj_]
-            adj_input = [Input(batch_shape=(None, None), sparse=False, name='adj_input')]
+            graph=[x]
+            for adjI in range(len(adjList)):
+                adj_ = preprocess_adj(adjList[adjI], self.sym_norm)
+                adj_ = adj_.todense()
+                graph.append(adj_)
+            adj_input = [Input(batch_shape=(None, None), sparse=False, name='adj_input'+str(adjI)) for adjI in range(len(adjList))]
         elif self.filter == 'chebyshev':
             print('Using Chebyshev polynomial basis filters...')
             L = normalized_laplacian(adj, self.sym_norm)
@@ -71,7 +74,7 @@ class MyGCN():
             adj_input = [Input(batch_shape=(None, None), sparse=False, name='adj_input'+str(i)) for i in range(support)]
         else:
             raise Exception('Invalid filter type.')
-        print(graph[0].shape,graph[1].shape)
+        # print(graph[0].shape,graph[1].shape)
         return graph, adj_input
     
     def build_model(self,x, y, adj_input):
@@ -88,26 +91,25 @@ class MyGCN():
         net = Flatten()(net)
         # output = Dense(y.shape[1], activation='softmax')(net)
         output = GraphConvolution(y.shape[1], self.support, activation='softmax')([net] + adj_input)
+        
         model = Model(inputs=[fea_input] + adj_input, outputs=output)
         model.compile(loss='categorical_crossentropy', optimizer=RMSprop())
         
         return model
 
 
-    def predict(self, x):
-        if x.shape[0]!=self.batch_size:
-            zx=np.zeros([self.batch_size,self.featureNum])
-            zx[:x.shape[0]]=x
-        else:
-            zx=x
-        x_graph,_ = self.get_inputs(self.adj, zx)
+    def predict(self, x, adjList):
+        batch_size=x.shape[0]
+        zx=x
+        adjList=[sc.sparse.csr_matrix(adjItem) for adjItem in adjList]
+        x_graph,_ = self.get_inputs(adjList, zx)
         # print(np.max(x_graph[0][:3]))
-        return self.myGCNModel.predict(x_graph, batch_size=self.batch_size)[:x.shape[0]]
+        return self.myGCNModel.predict(x_graph, batch_size=batch_size)
         
 
 if __name__ == '__main__':
     print("restructuring data ...")
-#     x, adj, y = load_data(dataset="cora")
+    
     corpus=np.array([
         ["friend hug enermy","hug"],
         ["enermy hug friend","hug"],
@@ -127,8 +129,9 @@ if __name__ == '__main__':
     y=CountVectorizer().fit_transform(corpus[:,1]).todense()
 
     print("training model ..")
-    model = MyGCN(x, y, adj,epochs=15,filter = 'localpool')
+    model = MyGCN(x, y, [adj],epochs=15,filter = 'localpool')
 
     print("evaluating model ..")
-    preY=model.predict(x)
+    preY=model.predict(x[:4],[adj[:4,:4]])
     
+    print(preY)
