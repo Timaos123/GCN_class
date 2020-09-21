@@ -10,6 +10,7 @@ from tensorflow.keras.regularizers import l2
 from graph import GraphConvolution
 from sklearn.feature_extraction.text import CountVectorizer,TfidfTransformer
 import scipy as sc
+import numpy as np
 
 import tqdm
 
@@ -19,13 +20,14 @@ class MyGCN():
         self,
         x,
         y,
-        adjList,
-        batch_size=64,
+        adjList=None,
+        batch_size=None,
         epochs=100,
         dataset='cora', # Local pooling filters (see 'renormalization trick' in Kipf & Welling, arXiv 2016)
         filter='localpool',
         max_degree=2,  # maximum polynomial degree
         sym_norm=True,  # symmetric (True) vs. left-only (False) normalization
+        learning_rate=0.1,
         NB_EPOCH=20,
         PATIENCE=10,  # early stopping patience
     ):
@@ -35,25 +37,59 @@ class MyGCN():
         self.NB_EPOCH = NB_EPOCH
         self.PATIENCE = PATIENCE
         self.epochs = epochs
-        self.batch_size = x.shape[0]
+        self.learning_rate=learning_rate
+        if batch_size is None:
+            self.batch_size = x.shape[0]
+        else:
+            self.batch_size = batch_size
         self.featureNum=x.shape[1]
-        
-        y_train, y_val, y_test, idx_train, idx_val, idx_test, train_mask = get_splits(y)
-        self.train_mask=train_mask
-        for adjI in range(len(adjList)):
-            if type(adjList[adjI])!=sc.sparse.csr_matrix:
-                adjList[adjI]=sc.sparse.csr_matrix(adjList[adjI])
+
+        if adjList is not None:
+            for adjI in range(len(adjList)):
+                if type(adjList[adjI])!=sc.sparse.csr_matrix:
+                    adjList[adjI]=sc.sparse.csr_matrix(adjList[adjI])
+        else:
+            adj=np.zeros(x.shape[0],x.shape[0])
+            for rowI in range(x.shape[0]):
+                for colI in range(x.shape[0]):
+                    if np.dot(x[rowI,:],x[colI,:])/np.linalg.norm(x[rowI,:])/np.linalg.norm(x[colI,:])>0.5:
+                        adj[rowI,colI]=1
+            adjList=[adj]
         self.adjList=adjList
         
         self.support=len(self.adjList)#超图数量
+        initIndexList=list(range(self.batch_size))
+        initX=x[initIndexList]
 
-        x_graph, adj_input = self.get_inputs(self.adjList, x)
-        
+        initAdjIndex=np.matrix([(row,col) for row in initIndexList for col in initIndexList]).T.tolist()
+        initAdjRowIndex=initAdjIndex[0]
+        initAdjColIndex=initAdjIndex[1]
+        initAdjList=[sc.sparse.csr_matrix((adjItem[initAdjRowIndex,initAdjColIndex].flatten().tolist()[0],
+                                            (initAdjRowIndex,initAdjColIndex)),
+                                            shape=[self.batch_size,self.batch_size])
+                                for adjItem in self.adjList]
+        _, adj_input = self.get_inputs(initAdjList, initX)
         self.myGCNModel=self.build_model(x, y, adj_input)
         
+        self.history=[]
         print("training model ...")
-        self.history=self.myGCNModel.fit(x_graph, y, sample_weight=self.train_mask,
-                            batch_size=self.batch_size, epochs=self.epochs, shuffle=False)
+        for i in range(self.epochs):
+            print("epoch",i)
+            for j in range(int(x.shape[0]/self.batch_size)):
+                sampleIndexList=(np.random.random_sample(self.batch_size)*x.shape[0]).astype(np.int64).tolist()
+                sampleX=x[sampleIndexList,:]
+                sampleAdjIndex=np.matrix([(row,col) for row in sampleIndexList for col in sampleIndexList]).T.tolist()
+                sampleAdjRowIndex=sampleAdjIndex[0]
+                sampleAdjColIndex=sampleAdjIndex[1]
+                sampleGraph=[sc.sparse.csr_matrix((adjItem[sampleAdjRowIndex,sampleAdjColIndex].flatten().tolist()[0],
+                                                (initAdjRowIndex,initAdjColIndex)),
+                                                shape=[self.batch_size,self.batch_size])
+                                    for adjItem in self.adjList]
+                sampleX_graph, _ = self.get_inputs(sampleGraph, sampleX)
+
+                sampleY=y[sampleIndexList,:]
+
+                self.history.append(self.myGCNModel.fit(sampleX_graph, sampleY, batch_size=self.batch_size, epochs=1, shuffle=False).history["loss"])
 
     def get_inputs(self,adjList, x):
         if self.filter == 'localpool':
@@ -93,7 +129,7 @@ class MyGCN():
         output = GraphConvolution(y.shape[1], self.support, activation='softmax')([net] + adj_input)
         
         model = Model(inputs=[fea_input] + adj_input, outputs=output)
-        model.compile(loss='categorical_crossentropy', optimizer=RMSprop())
+        model.compile(loss='categorical_crossentropy', optimizer=RMSprop(learning_rate=self.learning_rate))
         
         return model
 
@@ -105,7 +141,25 @@ class MyGCN():
         x_graph,_ = self.get_inputs(adjList, zx)
         # print(np.max(x_graph[0][:3]))
         return self.myGCNModel.predict(x_graph, batch_size=batch_size)
-        
+
+def splitWord(cw):
+    wi=0
+    while wi < len(cw):
+        # print(ord(cw[wi]))
+        if ord(cw[wi])<97 or ord(cw[wi])>122:
+            cw=cw[:wi]+" "+cw[wi]+cw[wi+1:]
+            wi+=1
+        wi+=1
+    return cw
+
+def cosSimGroup(w1,w2G,cvModel):
+    w1=[splitWord(w1)]
+    w2G=[splitWord(w2) for w2 in w2G]
+    v1=cvModel.transform(w1).todense()
+    v2=cvModel.transform(w2G).todense()
+    # print(v1,v2[:5])
+    # print(np.dot(v1,v2.T),np.linalg.norm(v1,ord=2),np.linalg.norm(v2,axis=-1,ord=2))
+    return np.dot(v1,v2.T)/np.linalg.norm(v1,ord=2)/np.linalg.norm(v2,axis=-1,ord=2)
 
 if __name__ == '__main__':
     print("restructuring data ...")
@@ -119,17 +173,19 @@ if __name__ == '__main__':
         ["dog love you","love"],
         ["dog love friend","love"]
     ])
+
     myCounter=CountVectorizer()
     x=myCounter.fit_transform(corpus[:,0]).todense()
+
     adj=np.zeros([x.shape[0],x.shape[0]])
     for rowI in range(x.shape[0]):
         for colI in range(x.shape[0]):
-            if corpus[rowI][1]==corpus[colI][1]:
-                adj[rowI,colI]=1
+            adj[rowI]=(np.array(cosSimGroup(corpus[rowI,0],corpus[:,0],myCounter))>0.5).astype(np.int64)
+                
     y=CountVectorizer().fit_transform(corpus[:,1]).todense()
 
     print("training model ..")
-    model = MyGCN(x, y, [adj],epochs=15,filter = 'localpool')
+    model = MyGCN(x, y, adjList=[adj],epochs=15,filter = 'localpool', learning_rate=0.01, batch_size=3)
 
     print("evaluating model ..")
     preY=model.predict(x[:4],[adj[:4,:4]])
