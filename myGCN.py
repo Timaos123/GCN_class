@@ -12,6 +12,7 @@ from sklearn.feature_extraction.text import CountVectorizer,TfidfTransformer
 import scipy as sc
 import numpy as np
 from sklearn.metrics import f1_score
+from sklearn.model_selection import train_test_split
 
 import jieba
 import pandas as pd
@@ -67,24 +68,24 @@ class MyGCN():
         output = GraphConvolution(self.classNum, self.support, activation='softmax')([net] + adj_input)
         
         model = Model(inputs=[fea_input] + adj_input, outputs=output)
-        model.compile(loss='categorical_crossentropy', optimizer=RMSprop(learning_rate=self.learning_rate))
+        model.compile(loss='sparse_categorical_crossentropy', optimizer=RMSprop(learning_rate=self.learning_rate))
         
         return model
 
     def get_inputs(self,adjList, x):
         if self.filter == 'localpool':
-            graph=[x]
+            graph=[np.array(x).astype(float)]
             for adjI in range(len(adjList)):
                 adj_ = preprocess_adj(adjList[adjI], self.sym_norm)
                 adj_ = adj_.todense()
-                graph.append(adj_)
+                graph.append(np.array(adj_).astype(float))
             adj_input = [Input(batch_shape=(None, None), sparse=False, name='adj_input'+str(adjI)) for adjI in range(len(adjList))]
         elif self.filter == 'chebyshev':
             L = normalized_laplacian(adj, self.sym_norm)
             L_scaled = rescale_laplacian(L)
             T_k = chebyshev_polynomial(L_scaled, self.max_degree)
             support = self.max_degree + 1
-            graph = [x] + T_k
+            graph = [np.array(x).astype(float)] + T_k
             adj_input = [Input(batch_shape=(None, None), sparse=False, name='adj_input'+str(i)) for i in range(support)]
         else:
             raise Exception('Invalid filter type.')
@@ -98,7 +99,8 @@ class MyGCN():
         return np.dot(w1,w2G.T)/np.linalg.norm(w1,ord=2)/np.linalg.norm(w2G,axis=-1,ord=2)
 
     def fit(self,x,y,adjList=None,epochs=15,batch_size=32):
-        self.batch_size=batch_size
+        # x=x.astype(float)
+        self.batch_size=min(batch_size,x.shape[0])
         self.history=[]
 
         if adjList is None:
@@ -111,7 +113,7 @@ class MyGCN():
         initAdjColIndex=[col for row in range(self.batch_size) for col in range(self.batch_size)]
         print("training model ...")
         for i in range(epochs):
-            print("epoch",i)
+            print("epoch:{}/{}".format(i+1,epochs))
             for j in tqdm.tqdm(range(int(x.shape[0]/self.batch_size))):
                 sampleIndexList=(np.random.random_sample(self.batch_size)*x.shape[0]).astype(np.int64).tolist()
                 sampleX=x[sampleIndexList,:]
@@ -126,7 +128,7 @@ class MyGCN():
                                     
                 sampleX_graph, _ = self.get_inputs(sampleAdjList, sampleX)
 
-                sampleY=y[sampleIndexList,:]
+                sampleY=y[sampleIndexList].astype(float)
 
                 loss=self.model.fit(sampleX_graph, sampleY, batch_size=self.batch_size, epochs=1, shuffle=False, verbose=False).history["loss"][0]
             print("loss:",loss)
@@ -141,14 +143,19 @@ class MyGCN():
             adjList=[np.matrix(adj)]
         
         preYList=[]
-        initAdjRowIndex=[row for row in range(self.batch_size) for col in range(self.batch_size)]
-        initAdjColIndex=[col for row in range(self.batch_size) for col in range(self.batch_size)]
         adjSize=self.batch_size
-        for batchI in range(int(x.shape[0]/self.batch_size)+1):
+        for batchI in tqdm.tqdm(range(int(x.shape[0]/self.batch_size)+1)):
+            initAdjRowIndex=[row for row in range(self.batch_size) for col in range(self.batch_size)]
+            initAdjColIndex=[col for row in range(self.batch_size) for col in range(self.batch_size)]
             sampleIndexList=list(range(batchI*self.batch_size,min((batchI+1)*self.batch_size,x.shape[0])))
             if len(sampleIndexList)<self.batch_size and len(sampleIndexList)>0:
-                initAdjRowIndex=initAdjRowIndex[:len(sampleIndexList)]
-                initAdjColIndex=initAdjColIndex[:len(sampleIndexList)]
+                adjIndex=0
+                while adjIndex < len(initAdjRowIndex):
+                    if (initAdjRowIndex[adjIndex] < len(sampleIndexList) and initAdjColIndex[adjIndex] < len(sampleIndexList))==False:
+                        initAdjRowIndex.pop(adjIndex)
+                        initAdjColIndex.pop(adjIndex)
+                        adjIndex-=1
+                    adjIndex+=1
                 adjSize=len(sampleIndexList)
             elif len(sampleIndexList)==0:
                 break
@@ -156,6 +163,7 @@ class MyGCN():
             sampleAdjRowIndex=sampleAdjIndex[0]
             sampleAdjColIndex=sampleAdjIndex[1]
             sampleX=x[sampleIndexList]
+            ss=adjList[0][sampleAdjRowIndex,sampleAdjColIndex].flatten().tolist()[0]
             sampleAdjList=[sc.sparse.csr_matrix((adjItem[sampleAdjRowIndex,sampleAdjColIndex].flatten().tolist()[0],
                                                 (initAdjRowIndex,initAdjColIndex)),
                                                 shape=[adjSize,adjSize])
@@ -178,31 +186,41 @@ def splitWord(cw):
 
 if __name__ == '__main__':
     print("restructuring data ...")
-    corpusDf=pd.read_csv("data/FAQ-DATA.csv")
-    corpusDf["text"]=corpusDf["text"].apply(lambda row:" ".join(list(jieba.cut(row))))
+    corpusDf=pd.read_csv("data/example.csv").loc[:,["text","class"]]
+    corpusDf["text"]=corpusDf["text"].astype(str).apply(lambda row:" ".join(list(jieba.cut(row))))
     corpus=corpusDf.values
 
     print("building vec/class vectorizer ...")
     xCounter=CountVectorizer(min_df=0, token_pattern='\w+')
-    x=xCounter.fit_transform([splitWord(row) for row in corpus[:,0]]).todense()
+    x=xCounter.fit_transform([splitWord(row[0]) for row in corpus[:,0]]).todense()
     maxLen=x.shape[1]
 
-    yCounter=CountVectorizer(min_df=0, token_pattern='\w+')
-    y=yCounter.fit_transform(corpus[:,1]).todense()
-    classNum=y.shape[1]
+    y=corpus[:,1].astype(int)
+    classNum=len(list(set(y.tolist())))
+
+    print("splitting train/test data ...")
+    trainX,testX,trainY,testY=train_test_split(x,y,test_size=0.2)
 
     print("building model ...")
     learning_rate=0.0001
     model = MyGCN(maxLen=maxLen,classNum=classNum, learning_rate=learning_rate)
+    model.model.summary()
 
     print("training model ...")
-    model.fit(x, y,epochs=150, batch_size=3)
-    
+    model.fit(trainX, trainY,epochs=500, batch_size=256)
+
+    print("evaluating model ...")
+    preY=model.predict(testX)
+    preYC=np.argmax(preY,axis=-1)
+    yC=testY
+    print("f1:",f1_score(yC,preYC,average="macro"))
+
+
     print("saving model ...")
     with open("model/xCounter.pkl","wb+") as xCounterFile:
         pkl.dump(xCounter,xCounterFile)
-    with open("model/yCounter.pkl","wb+") as yCounterFile:
-        pkl.dump(yCounter,yCounterFile)
+    # with open("model/yCounter.pkl","wb+") as yCounterFile:
+    #     pkl.dump(yCounter,yCounterFile)
     with open("model/myGCNHp.pkl","wb+") as modelHpFile:
         myGCNHp={
             "maxLen":maxLen,
@@ -211,10 +229,4 @@ if __name__ == '__main__':
         }
         pkl.dump(myGCNHp,modelHpFile)
     model.model.save_weights("model/myGCNModel")
-
-    print("evaluating model ...")
-    preY=model.predict(x)
-    preYC=np.argmax(preY,axis=-1)
-    yC=np.argmax(np.array(y),axis=-1)
-
-    print("f1:",f1_score(yC,preYC,average="macro"))
+    
